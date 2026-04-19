@@ -1,18 +1,14 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import httpx
-
-# ─────────────────────────────────────────
-#  VISHFIT AI — FastAPI + Ollama + Mistral
-# ─────────────────────────────────────────
+import asyncio
+from datetime import datetime
 
 app = FastAPI(title="Vishfit AI Chatbot")
 
-# Allow frontend to talk to this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,91 +16,114 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve the frontend HTML file
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# ─── Ollama Config ────────────────────────
+# ─── CONFIG ───────────────────────────────
 OLLAMA_URL  = "http://localhost:11434"
 MODEL_NAME  = "mistral"
 
-SYSTEM_PROMPT = """You are Vishfit AI, an expert personal fitness coach and nutritionist.
-Your personality is energetic, motivating, and knowledgeable.
-Give practical, safe, and science-backed advice on:
-- Workouts and exercise plans
-- Nutrition and diet
-- Weight loss and muscle building
-- Healthy lifestyle habits
-Keep responses concise, clear, and actionable.
-Always motivate and encourage the user."""
+N8N_WEBHOOK = "https://techhackein.app.n8n.cloud/webhook/vishfit"
 
-# ─── Request / Response Models ────────────
+SYSTEM_PROMPT = """You are VishFit AI, an elite personal fitness coach and nutritionist.
+
+## Your personality
+- Energetic, motivating, science-backed
+- Always give specific numbers (reps, sets, calories, duration)
+- Never give generic advice — always make it actionable
+
+## Response format
+1. Direct answer first (1-2 lines)
+2. Step-by-step plan with specifics
+3. End with one Pro Tip
+
+## Rules
+- Never say "I'm just an AI"
+- Always use both metric and imperial units
+- If user mentions injury, always suggest safe alternatives
+- Keep responses under 200 words unless a full plan is requested"""
+
 class Message(BaseModel):
-    role: str      # "user" or "assistant"
+    role: str
     content: str
 
 class ChatRequest(BaseModel):
     message: str
-    history: List[Message] = []   # full conversation history
+    history: List[Message] = []
+    user_name: Optional[str] = "Guest"
+    user_goal: Optional[str] = ""
+    session_id: Optional[str] = ""
 
 class ChatResponse(BaseModel):
     reply: str
 
-# ─── Health Check ─────────────────────────
+async def send_to_n8n(user_msg: str, ai_reply: str, user_name: str, user_goal: str, session_id: str):
+    try:
+        payload = {
+            "timestamp":    datetime.utcnow().isoformat(),
+            "session_id":   session_id,
+            "user_name":    user_name,
+            "user_goal":    user_goal,
+            "user_message": user_msg,
+            "ai_reply":     ai_reply,
+            "training_sample": {
+                "messages": [
+                    {"role": "system",    "content": SYSTEM_PROMPT},
+                    {"role": "user",      "content": user_msg},
+                    {"role": "assistant", "content": ai_reply}
+                ]
+            }
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(N8N_WEBHOOK, json=payload)
+    except Exception as e:
+        print(f"[n8n] Data send failed (non-critical): {e}")
+
 @app.get("/")
 def root():
-    return {"status": "Vishfit AI is running 💪", "model": MODEL_NAME}
+    return {"status": "Vishfit AI is running", "model": MODEL_NAME}
 
-# ─── Check if Ollama is alive ─────────────
 @app.get("/health")
-async def health_check():
+async def health():
     try:
         async with httpx.AsyncClient() as client:
             res = await client.get(f"{OLLAMA_URL}/api/tags", timeout=5)
-            models = res.json().get("models", [])
-            model_names = [m["name"] for m in models]
-            return {
-                "ollama": "running",
-                "available_models": model_names,
-                "using": MODEL_NAME
-            }
+            models = [m["name"] for m in res.json().get("models", [])]
+            return {"ollama": "running", "models": models, "using": MODEL_NAME}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Ollama not reachable: {e}")
 
-# ─── Main Chat Endpoint ───────────────────
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
-        # Build message list: system + history + new user message
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-        # Add conversation history
         for msg in request.history:
             messages.append({"role": msg.role, "content": msg.content})
-
-        # Add the new user message
         messages.append({"role": "user", "content": request.message})
 
         payload = {
-            "model": MODEL_NAME,
-            "messages": messages,
-            "stream": False
+            "model":      MODEL_NAME,
+            "messages":   messages,
+            "stream":     False,
+            "keep_alive": "10m"
         }
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                f"{OLLAMA_URL}/api/chat",
-                json=payload
-            )
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
             response.raise_for_status()
 
-        data  = response.json()
-        reply = data["message"]["content"]
+        reply = response.json()["message"]["content"]
+
+        asyncio.create_task(send_to_n8n(
+            user_msg   = request.message,
+            ai_reply   = reply,
+            user_name  = request.user_name,
+            user_goal  = request.user_goal,
+            session_id = request.session_id
+        ))
+
         return {"reply": reply}
 
     except httpx.ConnectError:
-        raise HTTPException(
-            status_code=503,
-            detail="Cannot connect to Ollama. Run: ollama serve"
-        )
+        raise HTTPException(status_code=503, detail="Ollama not running. Run: ollama serve")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
